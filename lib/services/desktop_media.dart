@@ -9,12 +9,18 @@ typedef _Open = Pointer<Utf8> Function(Pointer<Utf8>);
 typedef _FreeNative = Void Function(Pointer<Utf8>);
 typedef _Free = void Function(Pointer<Utf8>);
 
+/// 桌面端原生核心（流式解密）的库文件名：Windows 用 DLL，macOS 用 dylib。
+/// 仅加密视频流（短剧）会加载它；听书走明文 URL，不经过该库。
+String desktopCoreLibraryName() =>
+    Platform.isWindows ? 'fqapi_core.dll' : 'libfqapi_core.dylib';
+
 String desktopCoreLibraryPath() {
+  final name = desktopCoreLibraryName();
   final bundled = File(
-    '${File(Platform.resolvedExecutable).parent.path}/fqapi_core.dll',
+    '${File(Platform.resolvedExecutable).parent.path}/$name',
   );
   if (bundled.existsSync()) return bundled.path;
-  return File('rust/target/release/fqapi_core.dll').absolute.path;
+  return File('rust/target/release/$name').absolute.path;
 }
 
 class DesktopMedia {

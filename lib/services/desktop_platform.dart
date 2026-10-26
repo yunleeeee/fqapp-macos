@@ -23,8 +23,15 @@ import 'desktop_media.dart';
 import 'app_log.dart';
 import 'platform_channel.dart';
 
+/// macOS 原生移植端：复用全部 Windows 桌面适配层，仅平台专属点单独分支。
+bool get isMacOSDesktop =>
+    !kIsWeb && defaultTargetPlatform == TargetPlatform.macOS;
+
+/// 桌面功能总开关。整个代码库以它分流「手机版式 / 桌面版式」，macOS 移植
+/// 直接并入该集合，而不是新造第三个开关。
 bool get isWindowsDesktop =>
-    !kIsWeb && defaultTargetPlatform == TargetPlatform.windows;
+    !kIsWeb &&
+    (defaultTargetPlatform == TargetPlatform.windows || isMacOSDesktop);
 
 /// On Windows an inactive window is still visible; it simply lacks input focus.
 /// Only hidden/paused/detached windows should defer foreground video playback.
@@ -58,20 +65,50 @@ class DesktopPlatform with WindowListener {
 
   Future<void> initialize() async {
     if (!isWindowsDesktop) return;
-    MediaKit.ensureInitialized();
+    // 实验开关：跳过 windowManager 流程，回到系统默认 nib 窗口。
+    if (Platform.environment['FQAPP_NO_WM'] == '1') {
+      AppLog.d('desktop-init', 'FQAPP_NO_WM: skip windowManager flow');
+      return;
+    }
+    try {
+      await _initializeInner();
+    } catch (error, stack) {
+      AppLog.e('desktop-init', 'initialize failed', error: error, stack: stack);
+      // 窗口管理失败不能让整个 app 起不来：兜底直接跑 Dart 默认窗口流程。
+    }
+  }
+
+  Future<void> _initializeInner() async {
+    // macOS 打包后 CWD 是 /，media_kit 的 'Mpv.framework/Mpv' 相对查找必然
+    // 失败；显式指向 app bundle 内的 framework（dlopen 绝对路径）。
+    if (Platform.isMacOS) {
+      final bundledMpv = File(
+        '${File(Platform.resolvedExecutable).parent.parent.path}/Frameworks/Mpv.framework/Mpv',
+      );
+      MediaKit.ensureInitialized(
+        libmpv: bundledMpv.existsSync() ? bundledMpv.path : null,
+      );
+    } else {
+      MediaKit.ensureInitialized();
+    }
     await windowManager.ensureInitialized();
     PlatformChannels.invoke = invoke;
     PlatformChannels.events = events;
     windowManager.addListener(this);
     await windowManager.setPreventClose(true);
     final display = await screenRetriever.getPrimaryDisplay();
-    final available = display.visibleSize ?? display.size;
+    // merged UI/platform thread 下 screenRetriever 偶发返回 0×0，会让窗口
+    // 以 0 尺寸「显示」而不可见；非正数一律退回安全默认值。
+    final availW = (display.visibleSize ?? display.size).width;
+    final availH = (display.visibleSize ?? display.size).height;
+    final safeW = availW > 0 ? availW : 1440.0;
+    final safeH = availH > 0 ? availH : 900.0;
     await windowManager.waitUntilReadyToShow(
       WindowOptions(
-        size: Size(min(1280, available.width), min(800, available.height)),
+        size: Size(min(1280, safeW), min(800, safeH)),
         minimumSize: Size(
-          min(800, available.width),
-          min(440, available.height),
+          min(800, safeW),
+          min(440, safeH),
         ),
         center: true,
         title: '什锦铺',
@@ -81,6 +118,26 @@ class DesktopPlatform with WindowListener {
         await windowManager.focus();
       },
     );
+    // 兜底：merged UI/platform thread 下 callback 时序曾导致窗口从未上屏
+    //（WindowServer 层无窗口而进程正常）。再无条件 show 一次，幂等。
+    await windowManager.show();
+    final bounds = await windowManager.getBounds();
+    AppLog.d(
+      'desktop-init',
+      'post-show visible=${await windowManager.isVisible()} '
+          'focused=${await windowManager.isFocused()} '
+          'bounds=${bounds.width}x${bounds.height}@(${bounds.left},${bounds.top})',
+    );
+    // 曾观测到「窗口存在但不上屏」的会话级异常（后证实为本机 WindowServer
+    // 全局故障，连 Finder 也无窗口）。这里仅在窗口完全跑出屏幕时拉回。
+    final shown = await windowManager.getBounds();
+    if (shown.left < -50 || shown.top < -50) {
+      await windowManager.setBounds(
+        const Rect.fromLTWH(60, 60, 1280, 800),
+      );
+      await windowManager.show();
+      AppLog.d('desktop-init', 'recovered off-screen window');
+    }
     _tts.setCompletionHandler(() {
       final id = _utterance;
       if (id != null) {
@@ -94,31 +151,34 @@ class DesktopPlatform with WindowListener {
       _emit('fqapp/system_tts_events', {'type': 'error', 'id': id});
     });
     // Optional system media integration must not prevent reading or startup.
-    try {
-      await SMTCWindows.initialize();
-      _smtc = SMTCWindows();
-      _smtc!.buttonPressStream.listen((button) {
-        final action = switch (button) {
-          PressedButton.play => 'playPause',
-          PressedButton.pause => 'playPause',
-          PressedButton.next => 'next',
-          PressedButton.previous => 'prev',
-          PressedButton.stop => 'stop',
-          _ => null,
-        };
-        if (action != null) {
-          unawaited(
-            PlatformChannels.notify(
-              'fqapp/native_player',
-              'onNotificationAction',
-              {'action': action},
-            ),
-          );
-        }
-      });
-      await _smtc!.disableSmtc();
-    } catch (_) {
-      _smtc = null;
+    // SMTC 是 Windows 系统集成；macOS 上跳过（后续可接 MPNowPlayingInfoCenter）。
+    if (Platform.isWindows) {
+      try {
+        await SMTCWindows.initialize();
+        _smtc = SMTCWindows();
+        _smtc!.buttonPressStream.listen((button) {
+          final action = switch (button) {
+            PressedButton.play => 'playPause',
+            PressedButton.pause => 'playPause',
+            PressedButton.next => 'next',
+            PressedButton.previous => 'prev',
+            PressedButton.stop => 'stop',
+            _ => null,
+          };
+          if (action != null) {
+            unawaited(
+              PlatformChannels.notify(
+                'fqapp/native_player',
+                'onNotificationAction',
+                {'action': action},
+              ),
+            );
+          }
+        });
+        await _smtc!.disableSmtc();
+      } catch (_) {
+        _smtc = null;
+      }
     }
   }
 
@@ -299,10 +359,14 @@ class DesktopPlatform with WindowListener {
     switch (method) {
       case 'engines':
         final voices = await _tts.getVoices;
+        final isMac = Platform.isMacOS;
         return {
-          'defaultEngine': 'windows',
+          'defaultEngine': isMac ? 'macos' : 'windows',
           'engines': [
-            {'package': 'windows', 'label': 'Windows 默认语音'},
+            {
+              'package': isMac ? 'macos' : 'windows',
+              'label': isMac ? 'macOS 系统语音' : 'Windows 默认语音',
+            },
             if (voices is List)
               for (final voice in voices)
                 if (voice is Map && voice['name'] is String)
@@ -335,7 +399,7 @@ class DesktopPlatform with WindowListener {
         if (result == 0) {
           throw PlatformException(
             code: 'tts_failed',
-            message: 'Windows 语音不可用，请安装中文语音',
+            message: '系统语音不可用，请在系统设置中安装中文语音',
           );
         }
         return null;
@@ -345,7 +409,11 @@ class DesktopPlatform with WindowListener {
         await _tts.stop();
         return null;
       case 'settings':
-        await Process.run('explorer.exe', ['ms-settings:speech']);
+        if (Platform.isMacOS) {
+          await Process.run('open', ['-a', 'System Settings']);
+        } else {
+          await Process.run('explorer.exe', ['ms-settings:speech']);
+        }
         return null;
     }
     throw MissingPluginException(method);
@@ -412,11 +480,33 @@ class DesktopPlatform with WindowListener {
     'systemBrightness': 1.0,
   };
   void _updateAwake() {
+    // macOS：用系统自带的 caffeinate 进程代替 kernel32 的执行状态断言。
+    if (Platform.isMacOS) {
+      unawaited(_updateAwakeMacos());
+      return;
+    }
+    if (!Platform.isWindows) return;
     final call = DynamicLibrary.open('kernel32.dll')
         .lookupFunction<Uint32 Function(Uint32), int Function(int)>(
           'SetThreadExecutionState',
         );
     call(0x80000000 | (_readerAwake || _playerAwake ? 3 : 0));
+  }
+
+  Process? _caffeinate;
+  Future<void> _updateAwakeMacos() async {
+    final need = _readerAwake || _playerAwake;
+    if (need && _caffeinate == null) {
+      try {
+        // -i 仅阻止空闲休眠，不阻止合盖；随进程退出自动失效。
+        _caffeinate = await Process.start('caffeinate', ['-i']);
+      } catch (_) {
+        _caffeinate = null;
+      }
+    } else if (!need && _caffeinate != null) {
+      _caffeinate!.kill();
+      _caffeinate = null;
+    }
   }
 
   String _safeName(String name) =>
@@ -545,6 +635,11 @@ String decodeDesktopText(Uint8List bytes) {
   try {
     return utf8.decode(bytes).replaceFirst(RegExp('^\uFEFF'), '');
   } on FormatException {
+    // macOS 没有 kernel32：GBK 等非 UTF-8 编码先退回 Latin-1 兜底显示，
+    // 保证「能打开」；Windows 保持原有 cp54936 精确转码。
+    if (!Platform.isWindows) {
+      return latin1.decode(bytes, allowInvalid: true);
+    }
     final convert = DynamicLibrary.open('kernel32.dll')
         .lookupFunction<
           Int32 Function(
@@ -594,7 +689,14 @@ class _DesktopPlayer {
       player.stream.width.listen((_) => _size()),
       player.stream.height.listen((_) => _size()),
       player.stream.error.listen(
-        (_) => event('error', {'message': '媒体播放失败，请重试或切换清晰度'}),
+        (error) {
+          AppLog.e(
+            'desktop-player',
+            'id=$id mpv stream error',
+            error: error is Exception ? error : StateError(error),
+          );
+          event('error', {'message': '媒体播放失败，请重试或切换清晰度'});
+        },
       ),
     ]);
     unawaited(
@@ -611,8 +713,8 @@ class _DesktopPlayer {
   bool disposed = false;
   Future<void> open(String url, String key) async {
     ready.future.ignore();
+    var playbackUrl = url;
     try {
-      var playbackUrl = url;
       if (key.isNotEmpty) {
         final session = await DesktopMedia.open(url, key);
         if (disposed) {
@@ -631,7 +733,13 @@ class _DesktopPlayer {
       ready.complete();
       emit({'playerId': id, 'type': 'created', 'value': id});
       _size();
-    } catch (_) {
+    } catch (error, stack) {
+      AppLog.e(
+        'desktop-player',
+        'id=$id open failed url=$playbackUrl',
+        error: error,
+        stack: stack,
+      );
       if (!ready.isCompleted) ready.completeError(StateError('无法打开媒体'));
       if (!disposed) {
         emit({

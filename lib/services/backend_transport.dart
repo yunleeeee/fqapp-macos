@@ -1,7 +1,10 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
+import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart'
+    show ExternalLibrary;
 
 import '../src/rust/api.dart' as rust;
 import '../src/rust/frb_generated.dart';
@@ -158,7 +161,24 @@ class RustBackendTransport implements BackendTransport {
   bool _coreRunning = false;
 
   /// Loads the bridge runtime once per process.
-  static Future<void> ensureRuntime() => _runtimeReady ??= RustLib.init();
+  ///
+  /// macOS 打包后 CWD 不是仓库目录，FRB 默认加载器的 `rust/target/release/`
+  /// 解析不到库，因此显式按「可执行文件同目录 → 仓库构建目录」顺序加载。
+  static Future<void> ensureRuntime() =>
+      _runtimeReady ??= RustLib.init(externalLibrary: _macDesktopLibrary());
+
+  static ExternalLibrary? _macDesktopLibrary() {
+    if (!Platform.isMacOS) return null;
+    const name = 'libfqapi_core.dylib';
+    final candidates = [
+      '${File(Platform.resolvedExecutable).parent.path}/$name',
+      File('rust/target/release/$name').absolute.path,
+    ];
+    for (final path in candidates) {
+      if (File(path).existsSync()) return ExternalLibrary.open(path);
+    }
+    return null;
+  }
 
   /// Records that the runtime is already initialized, for hosts that load the
   /// shared library themselves (the host integration test opens an explicit

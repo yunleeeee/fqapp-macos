@@ -2,13 +2,19 @@ import 'dart:io';
 import 'package:path_provider/path_provider.dart';
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:webview_windows/webview_windows.dart';
+
+/// macOS 原生登录走 Runner 内的 WKWebView 窗口（fqapp/macos_login 频道），
+/// Windows 仍用 WebView2。频道返回的字符串即「读取书架」得到的 Cookie 头。
+const MethodChannel _macLoginChannel = MethodChannel('fqapp/macos_login');
 
 class DesktopLogin extends StatefulWidget {
   const DesktopLogin({super.key});
   static final _controller = WebviewController();
   static Future<void>? _initializing;
   static VoidCallback? _cancel;
+  static bool get _useMacosNative => !Platform.isWindows && !Platform.isAndroid;
   static Future<void> _initialize() => _initializing ??=
       (() async {
         final root = await getApplicationSupportDirectory();
@@ -24,6 +30,9 @@ class DesktopLogin extends StatefulWidget {
         throw e;
       });
   static Future<String?> open(BuildContext context) async {
+    if (_useMacosNative) {
+      return _macLoginChannel.invokeMethod<String>('login');
+    }
     await _initialize();
     if (!context.mounted) return null;
     return showDialog<String>(
@@ -33,8 +42,18 @@ class DesktopLogin extends StatefulWidget {
     );
   }
 
-  static void cancel() => _cancel?.call();
+  static void cancel() {
+    if (_useMacosNative) {
+      unawaited(_macLoginChannel.invokeMethod<dynamic>('cancelLogin'));
+      return;
+    }
+    _cancel?.call();
+  }
   static Future<void> clearSession() async {
+    if (_useMacosNative) {
+      await _macLoginChannel.invokeMethod<dynamic>('clearSession');
+      return;
+    }
     await _initialize();
     await _controller.clearCookies();
     await _controller.clearCache();
